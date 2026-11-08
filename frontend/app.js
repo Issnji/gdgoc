@@ -1,7 +1,35 @@
 /**
- * FilmLog — Frontend Companion for GDGoC Backend Assignment
- * Lightweight, zero-build Single Page Application.
+ * FilmLog — Frontend untuk backend Laravel (JWT) GDGoC.
+ * Zero-build SPA. Disesuaikan dengan kontrak backend di /backend/routes/api.php.
  */
+
+// ==========================================
+// 0. HELPERS
+// ==========================================
+const POSTER_FALLBACK = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450"><rect width="100%" height="100%" fill="#1e242b"/>' +
+  '<text x="50%" y="50%" fill="#8996a6" font-family="sans-serif" font-size="18" text-anchor="middle">No Poster</text></svg>'
+);
+
+// Escape semua data dari backend sebelum masuk innerHTML (cegah XSS dari review/username/judul).
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Backend menyimpan genres/cast sebagai array JSON, tapi tetap toleran terhadap string "a, b".
+function listOf(value) {
+  if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+  if (typeof value === 'string' && value.trim()) return value.split(',').map(v => v.trim()).filter(Boolean);
+  return [];
+}
+
+function posterOf(movie) {
+  return esc((movie && movie.poster_url) || POSTER_FALLBACK);
+}
+
+const POSTER_ONERROR = `this.onerror=null;this.src=POSTER_FALLBACK`;
 
 // ==========================================
 // 1. STATE MANAGEMENT
@@ -12,65 +40,101 @@ const state = {
   user: JSON.parse(localStorage.getItem('filmlog_user') || 'null'),
   currentTab: 'discover',
   authMode: 'login', // 'login' | 'register'
-  allMovies: [],
-  filteredMovies: [],
-  watchlist: [], // Array of movie objects or IDs
-  watchedList: [], // Array of watched review items
+  catalog: [],         // seluruh film (tanpa filter), dipakai untuk lookup dan daftar genre
+  filteredMovies: [],  // hasil GET /movies (sudah difilter server) yang ditampilkan di Discover
+  usingFallback: false, // true jika backend mati dan data diambil dari ../data/movies.json
+  watchlist: [],       // [{ id, user_id, movie_id, created_at, movie: {...} }]
+  watchedList: [],     // [{ id, user_id, movie_id, rating, review, watched_at, movie: {...} }]
   selectedGenre: 'ALL',
   searchQuery: '',
+  searchTimer: null,
+  movieRequestId: 0,
   activeDetailMovie: null,
   logs: []
 };
 
+function findMovie(movieId) {
+  const id = String(movieId);
+  return state.catalog.find(m => String(m.id) === id)
+    || state.filteredMovies.find(m => String(m.id) === id)
+    || null;
+}
+
+function entryMovieId(item) {
+  if (item && typeof item === 'object') {
+    return item.movie_id ?? item.movieId ?? (item.movie && item.movie.id) ?? item.id;
+  }
+  return item;
+}
+
 // ==========================================
 // 2. HTTP CLIENT & NETWORK INSPECTOR
 // ==========================================
+class ApiError extends Error {
+  constructor(message, status = 0, errors = null) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.errors = errors;
+  }
+}
+
+// Laravel mengirim error validasi sebagai { message, errors: { field: [msg, ...] } } (422).
+function collectErrorMessages(data) {
+  if (data && typeof data === 'object' && data.errors && typeof data.errors === 'object') {
+    const all = Object.values(data.errors).flat().filter(Boolean);
+    if (all.length) return [...new Set(all)];
+  }
+  return [];
+}
+
+function extractErrorMessage(data, status) {
+  const list = collectErrorMessages(data);
+  if (list.length) return list.join('\n');
+  if (data && typeof data === 'object' && (data.message || data.error)) return data.message || data.error;
+  return `Request gagal dengan status ${status}`;
+}
+
 async function apiFetch(endpoint, options = {}) {
   const url = `${state.apiBaseUrl.replace(/\/$/, '')}/${endpoint.replace(/^\//, '')}`;
   const method = options.method || 'GET';
   const headers = {
+    // Accept: application/json wajib untuk Laravel. Tanpa ini error validasi/401 bisa berupa redirect HTML.
+    'Accept': 'application/json',
     'Content-Type': 'application/json',
     ...(options.headers || {})
   };
 
-  if (state.token) {
-    headers['Authorization'] = `Bearer ${state.token}`;
+  const sentToken = state.token;
+  if (sentToken) {
+    headers['Authorization'] = `Bearer ${sentToken}`;
   }
 
   const startTime = performance.now();
   let status = 0;
-  let responseData = null;
-  let ok = false;
 
   try {
-    const res = await fetch(url, {
-      ...options,
-      headers
-    });
+    const res = await fetch(url, { ...options, headers });
     status = res.status;
-    ok = res.ok;
 
-    const contentType = res.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
-      responseData = await res.json();
-    } else {
-      responseData = await res.text();
-    }
+    const contentType = res.headers.get('content-type') || '';
+    const responseData = contentType.includes('application/json') ? await res.json() : await res.text();
 
     logApiRequest({
       time: new Date().toLocaleTimeString(),
       method,
       url,
       status,
-      ok,
+      ok: res.ok,
       duration: Math.round(performance.now() - startTime)
     });
 
-    if (!ok) {
-      const errorMsg = (typeof responseData === 'object' && (responseData.message || responseData.error))
-        ? (responseData.message || responseData.error)
-        : `Request failed with status ${status}`;
-      throw new Error(errorMsg);
+    if (!res.ok) {
+      // Token JWT kedaluwarsa/tidak valid pada endpoint terproteksi.
+      if (status === 401 && sentToken && !endpoint.startsWith('/auth')) {
+        handleSessionExpired();
+      }
+      throw new ApiError(extractErrorMessage(responseData, status), status, collectErrorMessages(responseData));
     }
 
     return responseData;
@@ -84,6 +148,7 @@ async function apiFetch(endpoint, options = {}) {
         ok: false,
         duration: Math.round(performance.now() - startTime)
       });
+      throw new ApiError(`Tidak dapat terhubung ke backend (${state.apiBaseUrl}). Pastikan server menyala dan CORS aktif.`, 0);
     }
     throw err;
   }
@@ -101,13 +166,13 @@ function logApiRequest(logItem) {
       <div class="flex items-center gap-2 overflow-hidden">
         <span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${
           l.ok ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'
-        }">${l.method}</span>
-        <span class="text-white truncate max-w-xs sm:max-w-md">${l.url}</span>
+        }">${esc(l.method)}</span>
+        <span class="text-white truncate max-w-xs sm:max-w-md">${esc(l.url)}</span>
       </div>
       <div class="flex items-center gap-3 shrink-0">
-        <span class="${l.ok ? 'text-emerald-400' : 'text-rose-400'} font-bold">${l.status}</span>
+        <span class="${l.ok ? 'text-emerald-400' : 'text-rose-400'} font-bold">${esc(l.status)}</span>
         <span class="text-brand-muted text-[10px]">${l.duration}ms</span>
-        <span class="text-brand-muted text-[10px] hidden sm:inline">${l.time}</span>
+        <span class="text-brand-muted text-[10px] hidden sm:inline">${esc(l.time)}</span>
       </div>
     </div>
   `).join('');
@@ -157,12 +222,10 @@ function updateApiUrlDisplay() {
 function switchTab(tabId) {
   state.currentTab = tabId;
 
-  // Update tabs UI
   document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
   const activeSection = document.getElementById(`tab-${tabId}`);
   if (activeSection) activeSection.classList.remove('hidden');
 
-  // Update desktop nav buttons
   document.querySelectorAll('.nav-tab').forEach(btn => {
     btn.classList.remove('text-white', 'bg-brand-card');
     btn.classList.add('text-brand-muted');
@@ -173,7 +236,6 @@ function switchTab(tabId) {
     activeNav.classList.add('text-white', 'bg-brand-card');
   }
 
-  // Refresh tab data if needed
   if (tabId === 'watchlist') {
     if (!state.token) {
       showToast('Silakan login terlebih dahulu untuk melihat Watchlist', 'info');
@@ -196,80 +258,103 @@ function switchTab(tabId) {
 // ==========================================
 // 5. MOVIES (DISCOVER)
 // ==========================================
+// Filter pencarian, genre, dan acak dikerjakan backend lewat query string:
+// GET /movies?search=...&genre=...&random=1
 async function loadDiscoverMovies(shuffle = false) {
   const statusEl = document.getElementById('movie-grid-status');
   const gridEl = document.getElementById('movie-grid');
+  const requestId = ++state.movieRequestId;
   statusEl.classList.remove('hidden');
 
+  const params = new URLSearchParams();
+  if (state.searchQuery) params.set('search', state.searchQuery);
+  if (state.selectedGenre !== 'ALL') params.set('genre', state.selectedGenre);
+  if (shuffle) params.set('random', '1');
+  const qs = params.toString();
+
   try {
-    // Try fetching from applicant's backend: GET /api/movies
-    const data = await apiFetch('/movies');
-    // Normalize response: could be array or { data: [...] }
-    state.allMovies = Array.isArray(data) ? data : (data.data || data.movies || []);
-    
-    if (shuffle) {
-      state.allMovies.sort(() => Math.random() - 0.5);
-      showToast('Daftar film berhasil diacak (shuffle)!', 'success');
+    const data = await apiFetch(`/movies${qs ? `?${qs}` : ''}`);
+    if (requestId !== state.movieRequestId) return; // respons usang (user sudah mengetik lagi)
+
+    const list = Array.isArray(data) ? data : (data.data || []);
+    state.usingFallback = false;
+    state.filteredMovies = list;
+
+    // Request tanpa filter = katalog lengkap, dipakai untuk lookup & pill genre.
+    if (!qs || !state.catalog.length) {
+      if (!qs) state.catalog = list;
+      renderGenrePills();
     }
 
-    applyMovieFilters();
+    if (shuffle) showToast('Daftar film berhasil diacak (shuffle)!', 'success');
+    renderMovieGrid();
     statusEl.classList.add('hidden');
     document.getElementById('api-status-dot').className = 'w-2 h-2 rounded-full bg-emerald-400';
   } catch (err) {
+    if (requestId !== state.movieRequestId) return;
     statusEl.classList.add('hidden');
     document.getElementById('api-status-dot').className = 'w-2 h-2 rounded-full bg-rose-500';
 
-    // Fallback: If backend is not running, load local static seed so applicant can see UI layout
+    // Fallback: backend belum jalan, pakai seed lokal supaya layout tetap terlihat.
     console.warn('Backend not reachable, loading fallback local seed:', err.message);
     try {
       const fallbackRes = await fetch('../data/movies.json');
-      state.allMovies = await fallbackRes.json();
-      if (shuffle) state.allMovies.sort(() => Math.random() - 0.5);
-      applyMovieFilters();
-      showToast('⚠️ Backend belum aktif. Menampilkan data lokal (fallback). Pastikan server backend Anda berjalan di ' + state.apiBaseUrl, 'warning');
+      state.catalog = await fallbackRes.json();
+      state.usingFallback = true;
+      renderGenrePills();
+      applyFallbackFilters(shuffle);
+      showToast('⚠️ Backend belum aktif. Menampilkan data lokal (fallback). Cek server di ' + state.apiBaseUrl, 'warning');
     } catch (fallbackErr) {
       gridEl.innerHTML = `
         <div class="col-span-full py-12 text-center text-rose-400 bg-rose-950/20 border border-rose-900/40 rounded-xl p-6">
-          <p class="font-bold mb-1">Gagal terhubung ke backend (${state.apiBaseUrl})</p>
-          <p class="text-xs text-brand-muted">Pastikan server backend Anda menyala dan mengizinkan CORS.</p>
+          <p class="font-bold mb-1">Gagal terhubung ke backend (${esc(state.apiBaseUrl)})</p>
+          <p class="text-xs text-brand-muted">${esc(err.message)}</p>
         </div>
       `;
     }
   }
 }
 
+// Hanya dipakai saat mode fallback (tanpa backend).
+function applyFallbackFilters(shuffle = false) {
+  const q = state.searchQuery.toLowerCase();
+  state.filteredMovies = state.catalog.filter(movie => {
+    const matchesSearch = !q
+      || movie.title.toLowerCase().includes(q)
+      || (movie.director && movie.director.toLowerCase().includes(q));
+    const matchesGenre = state.selectedGenre === 'ALL' || listOf(movie.genres).includes(state.selectedGenre);
+    return matchesSearch && matchesGenre;
+  });
+  if (shuffle) state.filteredMovies.sort(() => Math.random() - 0.5);
+  renderMovieGrid();
+}
+
 function handleMovieFilter() {
-  state.searchQuery = document.getElementById('movie-search').value.toLowerCase().trim();
-  applyMovieFilters();
+  state.searchQuery = document.getElementById('movie-search').value.trim();
+  clearTimeout(state.searchTimer);
+  state.searchTimer = setTimeout(() => loadDiscoverMovies(), 300); // debounce agar tidak spam request
 }
 
 function filterByGenre(genre) {
   state.selectedGenre = genre;
-  document.querySelectorAll('.genre-btn').forEach(btn => {
-    if (btn.innerText.trim() === genre || (genre === 'ALL' && btn.innerText.includes('All'))) {
-      btn.className = 'genre-btn px-3 py-1.5 rounded-full bg-white text-black font-semibold';
-    } else {
-      btn.className = 'genre-btn px-3 py-1.5 rounded-full bg-brand-surface border border-brand-border text-brand-muted hover:text-white';
-    }
-  });
-  applyMovieFilters();
+  renderGenrePills();
+  loadDiscoverMovies();
 }
 
-function applyMovieFilters() {
-  state.filteredMovies = state.allMovies.filter(movie => {
-    const matchesSearch = !state.searchQuery || 
-      movie.title.toLowerCase().includes(state.searchQuery) ||
-      (movie.director && movie.director.toLowerCase().includes(state.searchQuery));
+// Pill genre dibangun dari katalog backend, bukan hardcode.
+function renderGenrePills() {
+  const container = document.getElementById('genre-filters');
+  if (!container) return;
 
-    let movieGenres = Array.isArray(movie.genres) ? movie.genres : (movie.genres ? movie.genres.split(',') : []);
-    movieGenres = movieGenres.map(g => g.trim());
-
-    const matchesGenre = state.selectedGenre === 'ALL' || movieGenres.includes(state.selectedGenre);
-
-    return matchesSearch && matchesGenre;
-  });
-
-  renderMovieGrid();
+  const genres = [...new Set(state.catalog.flatMap(m => listOf(m.genres)))].sort();
+  const pill = (value, label) => {
+    const active = state.selectedGenre === value;
+    const cls = active
+      ? 'bg-white text-black font-semibold'
+      : 'bg-brand-surface border border-brand-border text-brand-muted hover:text-white';
+    return `<button data-genre="${esc(value)}" onclick="filterByGenre(this.dataset.genre)" class="genre-btn px-3 py-1.5 rounded-full whitespace-nowrap ${cls}">${esc(label)}</button>`;
+  };
+  container.innerHTML = pill('ALL', 'All Genres') + genres.map(g => pill(g, g)).join('');
 }
 
 function renderMovieGrid() {
@@ -288,39 +373,37 @@ function renderMovieGrid() {
 
   gridEl.innerHTML = state.filteredMovies.map(movie => {
     const isWatchlisted = isMovieInWatchlist(movie.id);
-    const poster = movie.poster_url || 'https://via.placeholder.com/300x450/1e242b/8996a6?text=No+Poster';
+    const isWatched = isMovieWatched(movie.id);
 
     return `
       <div class="poster-hover group relative bg-brand-card rounded-xl overflow-hidden border border-brand-border/70 hover:border-brand-green/60 transition-all duration-300 hover:shadow-xl hover:shadow-brand-green/10 flex flex-col">
-        <!-- Poster & Hover Overlay -->
-        <div class="relative aspect-[2/3] w-full overflow-hidden bg-brand-dark cursor-pointer" onclick="openMovieDetail(${movie.id})">
-          <img src="${poster}" alt="${movie.title}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" onerror="this.src='https://via.placeholder.com/300x450/1e242b/8996a6?text=Poster'" />
-          
-          <!-- Rating badge -->
+        <div class="relative aspect-[2/3] w-full overflow-hidden bg-brand-dark cursor-pointer" onclick="openMovieDetail(${Number(movie.id)})">
+          <img src="${posterOf(movie)}" alt="${esc(movie.title)}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" onerror="${POSTER_ONERROR}" />
+
           <div class="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-md bg-black/80 backdrop-blur text-xs font-bold text-amber-400 flex items-center gap-1 border border-white/10">
-            ★ <span>${movie.rating || 'N/A'}</span>
+            ★ <span>${esc(movie.rating ?? 'N/A')}</span>
           </div>
 
-          <!-- Quick Action Buttons Overlay -->
+          ${isWatched ? `<div class="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-md bg-brand-green/90 text-[10px] font-bold text-black">WATCHED</div>` : ''}
+
           <div class="poster-overlay absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent opacity-0 transition-opacity duration-200 flex flex-col justify-end p-3 space-y-2">
-            <button onclick="event.stopPropagation(); toggleWatchlist(${movie.id})" class="w-full py-1.5 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
+            <button onclick="event.stopPropagation(); toggleWatchlist(${Number(movie.id)})" class="w-full py-1.5 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
               isWatchlisted ? 'bg-rose-600 hover:bg-rose-500 text-white' : 'bg-brand-surface/90 hover:bg-brand-green hover:text-black text-white border border-brand-border'
             }">
               <i data-lucide="${isWatchlisted ? 'check' : 'bookmark'}" class="w-3.5 h-3.5"></i>
               <span>${isWatchlisted ? 'In Watchlist' : 'Add Watchlist'}</span>
             </button>
-            <button onclick="event.stopPropagation(); openWatchedModal(${movie.id})" class="w-full py-1.5 px-2 rounded-lg text-xs font-semibold bg-brand-surface/90 hover:bg-amber-400 hover:text-black text-white border border-brand-border flex items-center justify-center gap-1.5 transition">
+            <button onclick="event.stopPropagation(); openWatchedModal(${Number(movie.id)})" class="w-full py-1.5 px-2 rounded-lg text-xs font-semibold bg-brand-surface/90 hover:bg-amber-400 hover:text-black text-white border border-brand-border flex items-center justify-center gap-1.5 transition">
               <i data-lucide="star" class="w-3.5 h-3.5"></i>
-              <span>Mark Watched</span>
+              <span>${isWatched ? 'Sudah Ditonton' : 'Mark Watched'}</span>
             </button>
           </div>
         </div>
 
-        <!-- Info Bottom -->
         <div class="p-3 flex-1 flex flex-col justify-between">
           <div>
-            <h3 class="font-bold text-sm text-white line-clamp-1 group-hover:text-brand-green transition cursor-pointer" onclick="openMovieDetail(${movie.id})">${movie.title}</h3>
-            <p class="text-xs text-brand-muted mt-0.5">${movie.year} • ${movie.director || 'Unknown'}</p>
+            <h3 class="font-bold text-sm text-white line-clamp-1 group-hover:text-brand-green transition cursor-pointer" onclick="openMovieDetail(${Number(movie.id)})">${esc(movie.title)}</h3>
+            <p class="text-xs text-brand-muted mt-0.5">${esc(movie.year)} • ${esc(movie.director || 'Unknown')}</p>
           </div>
         </div>
       </div>
@@ -331,83 +414,80 @@ function renderMovieGrid() {
 }
 
 function isMovieInWatchlist(movieId) {
-  return state.watchlist.some(item => {
-    const id = item.movie_id || item.movieId || item.id || item;
-    return String(id) === String(movieId);
-  });
+  return state.watchlist.some(item => String(entryMovieId(item)) === String(movieId));
+}
+
+function isMovieWatched(movieId) {
+  return state.watchedList.some(item => String(entryMovieId(item)) === String(movieId));
 }
 
 // ==========================================
 // 6. MOVIE DETAIL MODAL
 // ==========================================
 async function openMovieDetail(movieId) {
-  let movie = state.allMovies.find(m => String(m.id) === String(movieId));
+  let movie = findMovie(movieId);
 
-  // If detail isn't full, try calling backend: GET /api/movies/:id
+  // GET /api/movies/:id membalas { data: {...} }
   try {
-    const remoteMovie = await apiFetch(`/movies/${movieId}`);
-    if (remoteMovie) movie = remoteMovie.data || remoteMovie;
+    const remote = await apiFetch(`/movies/${movieId}`);
+    if (remote) movie = remote.data || remote;
   } catch (err) {
-    // If endpoint not ready, fall back to existing movie in state
+    if (!movie) {
+      showToast(err.message, 'error');
+      return;
+    }
   }
 
   if (!movie) return;
   state.activeDetailMovie = movie;
 
   const isWatchlisted = isMovieInWatchlist(movie.id);
-  const poster = movie.poster_url || 'https://via.placeholder.com/300x450';
-  let genres = Array.isArray(movie.genres) ? movie.genres : (movie.genres ? movie.genres.split(',') : []);
-  let cast = Array.isArray(movie.cast) ? movie.cast : (movie.cast_members ? movie.cast_members.split(',') : []);
+  const genres = listOf(movie.genres);
+  const cast = listOf(movie.cast);
 
   const contentEl = document.getElementById('modal-detail-content');
   contentEl.innerHTML = `
     <div class="flex flex-col sm:flex-row gap-6">
-      <!-- Poster -->
       <div class="w-full sm:w-52 shrink-0">
-        <img src="${poster}" alt="${movie.title}" class="w-full rounded-xl shadow-xl border border-brand-border" />
+        <img src="${posterOf(movie)}" alt="${esc(movie.title)}" onerror="${POSTER_ONERROR}" class="w-full rounded-xl shadow-xl border border-brand-border" />
       </div>
 
-      <!-- Info -->
       <div class="flex-1 space-y-4">
         <div>
           <div class="flex items-center gap-2 mb-1">
-            <span class="text-xs font-bold px-2 py-0.5 rounded bg-brand-green/20 text-brand-green border border-brand-green/30">${movie.year}</span>
-            <span class="text-xs text-brand-muted">${movie.duration || ''}</span>
-            <span class="text-xs font-bold text-amber-400 flex items-center gap-0.5 ml-auto">★ ${movie.rating || 'N/A'}</span>
+            <span class="text-xs font-bold px-2 py-0.5 rounded bg-brand-green/20 text-brand-green border border-brand-green/30">${esc(movie.year)}</span>
+            <span class="text-xs text-brand-muted">${esc(movie.duration || '')}</span>
+            <span class="text-xs font-bold text-amber-400 flex items-center gap-0.5 ml-auto">★ ${esc(movie.rating ?? 'N/A')}</span>
           </div>
-          <h2 class="text-2xl sm:text-3xl font-black text-white leading-tight">${movie.title}</h2>
-          <p class="text-sm text-brand-muted mt-1">Directed by <span class="text-white font-medium">${movie.director || 'Unknown'}</span></p>
+          <h2 class="text-2xl sm:text-3xl font-black text-white leading-tight">${esc(movie.title)}</h2>
+          <p class="text-sm text-brand-muted mt-1">Directed by <span class="text-white font-medium">${esc(movie.director || 'Unknown')}</span></p>
         </div>
 
-        <!-- Genres Chips -->
         <div class="flex flex-wrap gap-1.5">
-          ${genres.map(g => `<span class="px-2 py-0.5 rounded-full bg-brand-dark border border-brand-border text-[11px] text-brand-muted">${g.trim()}</span>`).join('')}
+          ${genres.map(g => `<span class="px-2 py-0.5 rounded-full bg-brand-dark border border-brand-border text-[11px] text-brand-muted">${esc(g)}</span>`).join('')}
         </div>
 
-        <!-- Synopsis -->
         <div>
           <h4 class="text-xs font-bold text-brand-muted uppercase tracking-wider mb-1">Synopsis</h4>
-          <p class="text-sm text-gray-300 leading-relaxed">${movie.synopsis || 'No synopsis available.'}</p>
+          <p class="text-sm text-gray-300 leading-relaxed">${esc(movie.synopsis || 'No synopsis available.')}</p>
         </div>
 
-        <!-- Cast -->
         ${cast.length ? `
           <div>
             <h4 class="text-xs font-bold text-brand-muted uppercase tracking-wider mb-1">Cast</h4>
-            <p class="text-xs text-brand-muted">${cast.map(c => c.trim()).join(' • ')}</p>
+            <p class="text-xs text-brand-muted">${cast.map(esc).join(' • ')}</p>
           </div>
         ` : ''}
 
-        <!-- Actions -->
         <div class="pt-4 border-t border-brand-border flex items-center gap-3">
-          <button onclick="toggleWatchlist(${movie.id})" class="flex-1 py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition ${
+          <button onclick="toggleWatchlist(${Number(movie.id)})" class="flex-1 py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition ${
             isWatchlisted ? 'bg-rose-600 hover:bg-rose-500 text-white' : 'bg-brand-green text-black hover:brightness-110'
           }">
             <i data-lucide="${isWatchlisted ? 'check' : 'bookmark'}" class="w-4 h-4"></i>
             <span>${isWatchlisted ? 'Remove from Watchlist' : 'Add to Watchlist'}</span>
           </button>
 
-          <button onclick="closeMovieDetailModal(); openWatchedModal(${movie.id})" class="py-2.5 px-4 rounded-xl font-bold text-xs bg-brand-surfaceHover hover:bg-amber-400 hover:text-black border border-brand-border text-white flex items-center justify-center gap-2 transition">
+          <button onclick="closeMovieDetailModal(); openWatchedModal(${Number(movie.id)})" class="py-2.5 px-4 rounded-xl font-bold text-xs bg-brand-surfaceHover hover:bg-amber-400 hover:text-black border border-brand-border text-white flex items-center justify-center gap-2 transition">
             <i data-lucide="star" class="w-4 h-4"></i>
             <span>Log Review</span>
           </button>
@@ -416,38 +496,51 @@ async function openMovieDetail(movieId) {
     </div>
   `;
 
-  const modal = document.getElementById('movie-detail-modal');
-  modal.classList.remove('hidden');
-  setTimeout(() => modal.classList.remove('opacity-0'), 10);
+  showDetailModal();
   lucide.createIcons();
 }
 
+// Timer disimpan agar penutupan modal yang tertunda tidak menyembunyikan modal yang baru dibuka
+// (mis. klik "Log Review" dari modal detail).
+let detailModalTimer = null;
+
+function showDetailModal() {
+  clearTimeout(detailModalTimer);
+  const modal = document.getElementById('movie-detail-modal');
+  modal.classList.remove('hidden');
+  setTimeout(() => modal.classList.remove('opacity-0'), 10);
+}
+
 function closeMovieDetailModal() {
+  state.activeDetailMovie = null;
   const modal = document.getElementById('movie-detail-modal');
   modal.classList.add('opacity-0');
-  setTimeout(() => modal.classList.add('hidden'), 200);
+  detailModalTimer = setTimeout(() => modal.classList.add('hidden'), 200);
 }
 
 // ==========================================
-// 7. WATCHLIST LOGIC
+// 7. WATCHLIST
 // ==========================================
+function updateWatchlistBadge() {
+  const badge = document.getElementById('watchlist-badge');
+  const countEl = document.getElementById('watchlist-count');
+  if (badge) {
+    badge.textContent = state.watchlist.length;
+    badge.classList.toggle('hidden', state.watchlist.length === 0);
+  }
+  if (countEl) countEl.textContent = `${state.watchlist.length} films`;
+}
+
 async function loadWatchlist() {
   if (!state.token) return;
 
   try {
+    // GET /api/watchlist membalas { message, data: [{ ..., movie: {...} }] }
     const data = await apiFetch('/watchlist');
-    state.watchlist = Array.isArray(data) ? data : (data.data || data.watchlist || []);
-    
-    // Update badge count
-    const badge = document.getElementById('watchlist-badge');
-    const countEl = document.getElementById('watchlist-count');
-    if (badge) {
-      badge.textContent = state.watchlist.length;
-      badge.classList.toggle('hidden', state.watchlist.length === 0);
-    }
-    if (countEl) countEl.textContent = `${state.watchlist.length} films`;
-
+    state.watchlist = Array.isArray(data) ? data : (data.data || []);
+    updateWatchlistBadge();
     renderWatchlistGrid();
+    if (state.filteredMovies.length) renderMovieGrid(); // sinkronkan tombol di Discover
   } catch (err) {
     console.error('Failed to load watchlist:', err.message);
   }
@@ -460,35 +553,30 @@ async function toggleWatchlist(movieId) {
     return;
   }
 
-  const isCurrentlyIn = isMovieInWatchlist(movieId);
+  const id = Number(movieId);
 
   try {
-    if (isCurrentlyIn) {
+    if (isMovieInWatchlist(id)) {
       // DELETE /api/watchlist/:movieId
-      await apiFetch(`/watchlist/${movieId}`, { method: 'DELETE' });
-      state.watchlist = state.watchlist.filter(item => {
-        const id = item.movie_id || item.movieId || item.id || item;
-        return String(id) !== String(movieId);
-      });
+      await apiFetch(`/watchlist/${id}`, { method: 'DELETE' });
       showToast('Film dihapus dari watchlist', 'info');
     } else {
-      // POST /api/watchlist
-      const res = await apiFetch('/watchlist', {
+      // POST /api/watchlist  { movieId }
+      await apiFetch('/watchlist', {
         method: 'POST',
-        body: JSON.stringify({ movieId: movieId, movie_id: movieId })
+        body: JSON.stringify({ movieId: id })
       });
-      state.watchlist.push(res.data || { movieId });
       showToast('Berhasil ditambahkan ke watchlist! 📌', 'success');
     }
 
-    // Refresh UI
-    applyMovieFilters();
-    loadWatchlist();
-    if (state.activeDetailMovie && String(state.activeDetailMovie.id) === String(movieId)) {
-      openMovieDetail(movieId);
+    await loadWatchlist();
+    if (state.activeDetailMovie && String(state.activeDetailMovie.id) === String(id)) {
+      openMovieDetail(id);
     }
   } catch (err) {
     showToast(err.message, 'error');
+    // 409 (sudah ada) / 404 (sudah terhapus) berarti state lokal usang, sinkronkan ulang.
+    if (err.status === 409 || err.status === 404) loadWatchlist();
   }
 }
 
@@ -505,33 +593,24 @@ function renderWatchlistGrid() {
 
   emptyEl.classList.add('hidden');
   gridEl.innerHTML = state.watchlist.map(item => {
-    // Watchlist item might be movie object or { movieId: 1, movie: {...} }
-    const movieId = item.movie_id || item.movieId || item.id || item;
-    const movie = item.movie || state.allMovies.find(m => String(m.id) === String(movieId)) || {
-      id: movieId,
-      title: item.title || `Movie #${movieId}`,
-      year: item.year || '',
-      rating: item.rating || '',
-      poster_url: item.poster_url || ''
-    };
-
-    const poster = movie.poster_url || 'https://via.placeholder.com/300x450';
+    const movieId = entryMovieId(item);
+    const movie = item.movie || findMovie(movieId) || { id: movieId, title: `Movie #${movieId}` };
 
     return `
       <div class="bg-brand-card rounded-xl overflow-hidden border border-brand-border flex flex-col group">
-        <div class="relative aspect-[2/3] overflow-hidden bg-brand-dark cursor-pointer" onclick="openMovieDetail(${movie.id})">
-          <img src="${poster}" alt="${movie.title}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
+        <div class="relative aspect-[2/3] overflow-hidden bg-brand-dark cursor-pointer" onclick="openMovieDetail(${Number(movie.id)})">
+          <img src="${posterOf(movie)}" alt="${esc(movie.title)}" onerror="${POSTER_ONERROR}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
         </div>
         <div class="p-3 flex-1 flex flex-col justify-between">
           <div>
-            <h4 class="font-bold text-sm text-white truncate cursor-pointer hover:text-brand-green" onclick="openMovieDetail(${movie.id})">${movie.title}</h4>
-            <p class="text-xs text-brand-muted mt-0.5">${movie.year || ''}</p>
+            <h4 class="font-bold text-sm text-white truncate cursor-pointer hover:text-brand-green" onclick="openMovieDetail(${Number(movie.id)})">${esc(movie.title)}</h4>
+            <p class="text-xs text-brand-muted mt-0.5">${esc(movie.year || '')}</p>
           </div>
           <div class="flex items-center gap-2 mt-3 pt-2 border-t border-brand-border">
-            <button onclick="toggleWatchlist(${movie.id})" class="text-xs text-rose-400 hover:text-rose-300 py-1 flex items-center gap-1">
+            <button onclick="toggleWatchlist(${Number(movie.id)})" class="text-xs text-rose-400 hover:text-rose-300 py-1 flex items-center gap-1">
               <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Hapus
             </button>
-            <button onclick="openWatchedModal(${movie.id})" class="text-xs text-amber-400 hover:text-amber-300 py-1 ml-auto flex items-center gap-1 font-semibold">
+            <button onclick="openWatchedModal(${Number(movie.id)})" class="text-xs text-amber-400 hover:text-amber-300 py-1 ml-auto flex items-center gap-1 font-semibold">
               <i data-lucide="check-circle" class="w-3.5 h-3.5"></i> Watched
             </button>
           </div>
@@ -550,9 +629,14 @@ async function loadWatchedList() {
   if (!state.token) return;
 
   try {
+    // GET /api/watched membalas { message, data: [{ rating, review, watched_at, movie: {...} }] }
     const data = await apiFetch('/watched');
-    state.watchedList = Array.isArray(data) ? data : (data.data || data.watched || []);
+    const list = Array.isArray(data) ? data : (data.data || []);
+    // Backend tidak mengurutkan, tampilkan yang terbaru dulu.
+    state.watchedList = list.slice().sort((a, b) =>
+      new Date(b.watched_at || b.created_at || 0) - new Date(a.watched_at || a.created_at || 0));
     renderWatchedList();
+    if (state.filteredMovies.length) renderMovieGrid();
   } catch (err) {
     console.error('Failed to load watched list:', err.message);
   }
@@ -565,17 +649,24 @@ function openWatchedModal(movieId) {
     return;
   }
 
-  const movie = state.allMovies.find(m => String(m.id) === String(movieId)) || { id: movieId, title: `Movie #${movieId}` };
+  // Backend menolak duplikat (409), jadi arahkan ke daftar watched.
+  if (isMovieWatched(movieId)) {
+    showToast('Film ini sudah tercatat di Watched. Hapus dulu jika ingin mencatat ulang.', 'info');
+    switchTab('watched');
+    return;
+  }
+
+  const movie = findMovie(movieId) || { id: movieId, title: `Movie #${movieId}` };
 
   const contentEl = document.getElementById('modal-detail-content');
   contentEl.innerHTML = `
     <div class="space-y-4">
       <div class="border-b border-brand-border pb-3">
         <span class="text-xs font-bold text-brand-green uppercase tracking-wider">Log Review & Thoughts</span>
-        <h2 class="text-2xl font-bold text-white mt-1">${movie.title}</h2>
+        <h2 class="text-2xl font-bold text-white mt-1">${esc(movie.title)}</h2>
       </div>
 
-      <form id="watched-form" onsubmit="handleWatchedSubmit(event, ${movie.id})" class="space-y-4">
+      <form id="watched-form" onsubmit="handleWatchedSubmit(event, ${Number(movie.id)})" class="space-y-4">
         <div>
           <label class="block text-xs font-semibold text-brand-muted uppercase mb-1.5">Rating Kamu (1 - 5 Bintang)</label>
           <div class="flex items-center gap-2" id="star-selector">
@@ -589,13 +680,13 @@ function openWatchedModal(movieId) {
         </div>
 
         <div>
-          <label class="block text-xs font-semibold text-brand-muted uppercase mb-1.5">Opini & Review Kamu</label>
-          <textarea id="watched-review-input" rows="4" required placeholder="Tuliskan pendapatmu tentang alur cerita, akting, atau kesan setelah menonton film ini..." class="w-full bg-brand-dark border border-brand-border rounded-xl p-3 text-sm text-white placeholder-brand-muted focus:outline-none focus:border-brand-green resize-none"></textarea>
+          <label class="block text-xs font-semibold text-brand-muted uppercase mb-1.5">Opini & Review Kamu <span class="normal-case font-normal">(opsional, maks. 1000 karakter)</span></label>
+          <textarea id="watched-review-input" rows="4" maxlength="1000" placeholder="Tuliskan pendapatmu tentang alur cerita, akting, atau kesan setelah menonton film ini..." class="w-full bg-brand-dark border border-brand-border rounded-xl p-3 text-sm text-white placeholder-brand-muted focus:outline-none focus:border-brand-green resize-none"></textarea>
         </div>
 
         <div class="pt-3 border-t border-brand-border flex items-center justify-end gap-3">
           <button type="button" onclick="closeMovieDetailModal()" class="px-4 py-2 text-sm text-brand-muted hover:text-white transition">Batal</button>
-          <button type="submit" class="px-5 py-2.5 bg-brand-green text-black font-bold text-sm rounded-xl hover:brightness-110 transition flex items-center gap-2">
+          <button type="submit" id="watched-submit-btn" class="px-5 py-2.5 bg-brand-green text-black font-bold text-sm rounded-xl hover:brightness-110 transition flex items-center gap-2">
             <i data-lucide="check" class="w-4 h-4"></i> Simpan Catatan
           </button>
         </div>
@@ -604,9 +695,7 @@ function openWatchedModal(movieId) {
   `;
 
   setRatingValue(5);
-  const modal = document.getElementById('movie-detail-modal');
-  modal.classList.remove('hidden');
-  setTimeout(() => modal.classList.remove('opacity-0'), 10);
+  showDetailModal();
   lucide.createIcons();
 }
 
@@ -615,31 +704,25 @@ function setRatingValue(val) {
   if (input) input.value = val;
 
   document.querySelectorAll('#star-selector .star-btn').forEach(btn => {
-    const starNum = parseInt(btn.getAttribute('data-star'));
-    if (starNum <= val) {
-      btn.className = 'star-btn text-2xl text-amber-400 transition scale-110';
-    } else {
-      btn.className = 'star-btn text-2xl text-brand-muted transition';
-    }
+    const starNum = parseInt(btn.getAttribute('data-star'), 10);
+    btn.className = starNum <= val
+      ? 'star-btn text-2xl text-amber-400 transition scale-110'
+      : 'star-btn text-2xl text-brand-muted transition';
   });
 }
 
 async function handleWatchedSubmit(event, movieId) {
   event.preventDefault();
-  const rating = parseFloat(document.getElementById('watched-rating-input').value);
+  const rating = parseInt(document.getElementById('watched-rating-input').value, 10); // backend: integer 1-5
   const review = document.getElementById('watched-review-input').value.trim();
+  const btn = document.getElementById('watched-submit-btn');
+  btn.disabled = true;
 
   try {
-    // POST /api/watched
+    // POST /api/watched  { movieId, rating, review }
     await apiFetch('/watched', {
       method: 'POST',
-      body: JSON.stringify({
-        movieId: movieId,
-        movie_id: movieId,
-        rating: rating,
-        review: review,
-        opinion: review
-      })
+      body: JSON.stringify({ movieId: Number(movieId), rating, review: review || null })
     });
 
     showToast('Catatan film berhasil disimpan! ⭐', 'success');
@@ -647,7 +730,26 @@ async function handleWatchedSubmit(event, movieId) {
     loadWatchedList();
   } catch (err) {
     showToast(err.message, 'error');
+    if (err.status === 409) {
+      closeMovieDetailModal();
+      loadWatchedList();
+    }
+  } finally {
+    btn.disabled = false;
   }
+}
+
+async function removeWatched(movieId) {
+  if (!confirm('Hapus catatan film ini dari daftar Watched?')) return;
+
+  try {
+    // DELETE /api/watched/:movieId
+    await apiFetch(`/watched/${Number(movieId)}`, { method: 'DELETE' });
+    showToast('Catatan watched dihapus', 'info');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+  loadWatchedList();
 }
 
 function renderWatchedList() {
@@ -663,69 +765,72 @@ function renderWatchedList() {
 
   emptyEl.classList.add('hidden');
   container.innerHTML = state.watchedList.map(item => {
-    const movieId = item.movie_id || item.movieId || (item.movie && item.movie.id);
-    const movie = item.movie || state.allMovies.find(m => String(m.id) === String(movieId)) || {
-      title: item.title || `Movie #${movieId}`,
-      year: item.year || '',
-      poster_url: item.poster_url || ''
-    };
+    const movieId = entryMovieId(item);
+    const movie = item.movie || findMovie(movieId) || { id: movieId, title: `Movie #${movieId}` };
 
-    const ratingStars = '★'.repeat(Math.round(item.rating || 5)) + '☆'.repeat(Math.max(0, 5 - Math.round(item.rating || 5)));
-    const poster = movie.poster_url || 'https://via.placeholder.com/300x450';
-    const dateStr = item.created_at || item.createdAt ? new Date(item.created_at || item.createdAt).toLocaleDateString('id-ID', { dateStyle: 'medium' }) : 'Baru saja';
+    const stars = Math.min(5, Math.max(0, Math.round(Number(item.rating) || 0)));
+    const ratingStars = '★'.repeat(stars) + '☆'.repeat(5 - stars);
+    const rawDate = item.watched_at || item.created_at;
+    const dateStr = rawDate ? new Date(rawDate).toLocaleDateString('id-ID', { dateStyle: 'medium' }) : 'Baru saja';
 
     return `
       <div class="bg-brand-surface p-4 sm:p-5 rounded-2xl border border-brand-border flex gap-4 sm:gap-6 items-start">
-        <img src="${poster}" alt="${movie.title}" class="w-16 sm:w-20 aspect-[2/3] object-cover rounded-lg shrink-0 border border-brand-border shadow-md" />
+        <img src="${posterOf(movie)}" alt="${esc(movie.title)}" onerror="${POSTER_ONERROR}" class="w-16 sm:w-20 aspect-[2/3] object-cover rounded-lg shrink-0 border border-brand-border shadow-md" />
         <div class="flex-1 space-y-2">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-            <h4 class="font-bold text-base text-white hover:text-brand-green cursor-pointer" onclick="openMovieDetail(${movieId})">
-              ${movie.title} <span class="text-xs text-brand-muted font-normal">(${movie.year || ''})</span>
+            <h4 class="font-bold text-base text-white hover:text-brand-green cursor-pointer" onclick="openMovieDetail(${Number(movie.id)})">
+              ${esc(movie.title)} <span class="text-xs text-brand-muted font-normal">(${esc(movie.year || '')})</span>
             </h4>
             <div class="flex items-center gap-2">
               <span class="text-amber-400 font-bold text-sm tracking-wider">${ratingStars}</span>
-              <span class="text-[11px] text-brand-muted">${dateStr}</span>
+              <span class="text-[11px] text-brand-muted">${esc(dateStr)}</span>
             </div>
           </div>
-          <p class="text-sm text-gray-300 leading-relaxed bg-brand-dark/40 p-3 rounded-xl border border-brand-border/40 font-normal">
-            "${item.review || item.opinion || 'Tidak ada catatan ulasan.'}"
-          </p>
+          <p class="text-sm text-gray-300 leading-relaxed bg-brand-dark/40 p-3 rounded-xl border border-brand-border/40 font-normal whitespace-pre-line">${
+            item.review ? `"${esc(item.review)}"` : '<span class="text-brand-muted italic">Tidak ada catatan ulasan.</span>'
+          }</p>
+          <div class="flex justify-end">
+            <button onclick="removeWatched(${Number(movie.id)})" class="text-xs text-rose-400 hover:text-rose-300 flex items-center gap-1">
+              <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Hapus
+            </button>
+          </div>
         </div>
       </div>
     `;
   }).join('');
+
+  lucide.createIcons();
 }
 
 // ==========================================
 // 9. AI RECOMMENDATION (GEMINI)
 // ==========================================
 function setAiPrompt(text) {
-  document.getElementById('ai-prompt-input').value = text;
+  document.getElementById('ai-prompt-input').value = text.trim();
 }
 
 async function submitAiRecommendation() {
   const promptInput = document.getElementById('ai-prompt-input');
   const prompt = promptInput.value.trim();
-  if (!prompt) {
-    showToast('Tuliskan deskripsi atau suasana film yang ingin kamu cari', 'warning');
+  if (prompt.length < 3) {
+    showToast('Tuliskan deskripsi atau suasana film yang ingin kamu cari (min. 3 karakter)', 'warning');
     return;
   }
 
   const btn = document.getElementById('btn-submit-ai');
   const resultContainer = document.getElementById('ai-result-container');
-  
+
   btn.disabled = true;
   btn.innerHTML = `<div class="animate-spin w-4 h-4 border-2 border-black border-t-transparent rounded-full"></div> Analyzing...`;
 
   try {
-    // POST /api/movies/recommend
+    // POST /api/movies/recommend  { prompt }  ->  { movie_id, reasoning }
     const response = await apiFetch('/movies/recommend', {
       method: 'POST',
-      body: JSON.stringify({ prompt: prompt, query: prompt, description: prompt })
+      body: JSON.stringify({ prompt })
     });
 
-    const resultData = response.data || response;
-    renderAiRecommendation(resultData);
+    await renderAiRecommendation(response.data || response);
     resultContainer.classList.remove('hidden');
     showToast('Gemini berhasil menemukan film yang cocok! ✨', 'success');
   } catch (err) {
@@ -737,23 +842,21 @@ async function submitAiRecommendation() {
   }
 }
 
-function renderAiRecommendation(data) {
+async function renderAiRecommendation(data) {
   const container = document.getElementById('ai-result-container');
-  
-  // Backend might return { movie_id: 1, reasoning: "..." } or full { movie: {...}, reasoning: "..." }
-  const movieId = data.movie_id || data.movieId || (data.movie && data.movie.id);
-  const matchedMovie = data.movie || state.allMovies.find(m => String(m.id) === String(movieId)) || {
-    id: movieId || 1,
-    title: data.title || 'Recommended Film',
-    year: data.year || '',
-    genres: data.genres || ['Recommended'],
-    rating: data.rating || 8.5,
-    synopsis: data.synopsis || '',
-    poster_url: data.poster_url || 'https://via.placeholder.com/300x450'
-  };
+  const movieId = data.movie_id;
 
-  const reasoning = data.reasoning || data.explanation || data.message || 'Film ini dipilih berdasarkan kecocokan tema, plot, dan atmosfer yang Anda minta.';
-  const poster = matchedMovie.poster_url || 'https://via.placeholder.com/300x450';
+  // Backend hanya membalas movie_id + reasoning, jadi detail film diambil dari katalog / GET /movies/:id.
+  let movie = findMovie(movieId);
+  if (!movie && movieId) {
+    try {
+      const remote = await apiFetch(`/movies/${movieId}`);
+      movie = remote.data || remote;
+    } catch (err) { /* tampilkan reasoning saja */ }
+  }
+  movie = movie || { id: movieId, title: `Movie #${movieId}` };
+
+  const reasoning = data.reasoning || 'Film ini dipilih berdasarkan kecocokan tema, plot, dan atmosfer yang kamu minta.';
 
   container.innerHTML = `
     <div class="bg-gradient-to-br from-brand-surface via-brand-card to-brand-surface p-6 sm:p-8 rounded-2xl border-2 border-brand-green/40 shadow-2xl relative overflow-hidden">
@@ -767,33 +870,30 @@ function renderAiRecommendation(data) {
         </div>
 
         <div class="flex flex-col sm:flex-row gap-6 items-start">
-          <img src="${poster}" alt="${matchedMovie.title}" class="w-36 sm:w-44 aspect-[2/3] object-cover rounded-xl border border-brand-border shadow-xl shrink-0" />
-          
+          <img src="${posterOf(movie)}" alt="${esc(movie.title)}" onerror="${POSTER_ONERROR}" class="w-36 sm:w-44 aspect-[2/3] object-cover rounded-xl border border-brand-border shadow-xl shrink-0" />
+
           <div class="flex-1 space-y-3">
             <div>
               <div class="flex items-center gap-2">
-                <span class="text-xs font-bold text-amber-400">★ ${matchedMovie.rating || 'N/A'}</span>
-                <span class="text-xs text-brand-muted">• ${matchedMovie.year || ''}</span>
+                <span class="text-xs font-bold text-amber-400">★ ${esc(movie.rating ?? 'N/A')}</span>
+                <span class="text-xs text-brand-muted">• ${esc(movie.year || '')}</span>
               </div>
-              <h3 class="text-2xl font-black text-white hover:text-brand-green cursor-pointer" onclick="openMovieDetail(${matchedMovie.id})">${matchedMovie.title}</h3>
-              <p class="text-xs text-brand-muted">Directed by ${matchedMovie.director || 'Unknown'}</p>
+              <h3 class="text-2xl font-black text-white hover:text-brand-green cursor-pointer" onclick="openMovieDetail(${Number(movie.id)})">${esc(movie.title)}</h3>
+              <p class="text-xs text-brand-muted">Directed by ${esc(movie.director || 'Unknown')}</p>
             </div>
 
-            <!-- Gemini Reasoning Card -->
             <div class="bg-brand-dark/70 border border-brand-border/60 rounded-xl p-4 space-y-1.5">
               <span class="text-xs font-bold text-brand-green flex items-center gap-1.5">
                 <i data-lucide="bot" class="w-3.5 h-3.5"></i> Alasan Rekomendasi (Gemini Analysis):
               </span>
-              <p class="text-xs text-gray-200 leading-relaxed italic">
-                "${reasoning}"
-              </p>
+              <p class="text-xs text-gray-200 leading-relaxed italic">"${esc(reasoning)}"</p>
             </div>
 
             <div class="pt-2 flex items-center gap-3">
-              <button onclick="openMovieDetail(${matchedMovie.id})" class="px-4 py-2 bg-brand-surfaceHover border border-brand-border hover:border-brand-green text-xs font-semibold text-white rounded-xl transition">
+              <button onclick="openMovieDetail(${Number(movie.id)})" class="px-4 py-2 bg-brand-surfaceHover border border-brand-border hover:border-brand-green text-xs font-semibold text-white rounded-xl transition">
                 Lihat Detail Lengkap
               </button>
-              <button onclick="toggleWatchlist(${matchedMovie.id})" class="px-4 py-2 bg-brand-green text-black text-xs font-bold rounded-xl hover:brightness-110 transition flex items-center gap-1.5">
+              <button onclick="toggleWatchlist(${Number(movie.id)})" class="px-4 py-2 bg-brand-green text-black text-xs font-bold rounded-xl hover:brightness-110 transition flex items-center gap-1.5">
                 <i data-lucide="bookmark" class="w-3.5 h-3.5"></i> Masukkan ke Watchlist
               </button>
             </div>
@@ -814,12 +914,13 @@ function renderAuthUI() {
   if (!container) return;
 
   if (state.token && state.user) {
+    const name = state.user.username || state.user.email || 'U';
     container.innerHTML = `
       <div class="flex items-center space-x-2">
         <div class="w-8 h-8 rounded-full bg-brand-border flex items-center justify-center font-bold text-xs text-white uppercase border border-brand-border">
-          ${(state.user.username || state.user.email || 'U')[0]}
+          ${esc(name[0])}
         </div>
-        <span class="text-xs font-semibold text-white hidden sm:inline">${state.user.username || state.user.email}</span>
+        <span class="text-xs font-semibold text-white hidden sm:inline">${esc(name)}</span>
         <button onclick="logout()" title="Logout" class="p-1.5 rounded-lg text-brand-muted hover:text-rose-400 hover:bg-rose-950/20 transition">
           <i data-lucide="log-out" class="w-4 h-4"></i>
         </button>
@@ -856,6 +957,8 @@ function closeAuthModal() {
 function setAuthMode(mode) {
   state.authMode = mode;
   const usernameField = document.getElementById('field-username-container');
+  const usernameInput = document.getElementById('auth-username');
+  const passwordInput = document.getElementById('auth-password');
   const submitBtn = document.getElementById('auth-submit-btn');
   const tabLogin = document.getElementById('auth-tab-login');
   const tabRegister = document.getElementById('auth-tab-register');
@@ -864,15 +967,40 @@ function setAuthMode(mode) {
 
   if (mode === 'register') {
     usernameField.classList.remove('hidden');
+    usernameInput.required = true;      // backend: required, 3-50, alpha_dash, unique
+    passwordInput.minLength = 8;        // backend: min 8
     submitBtn.textContent = 'Create Account';
     tabRegister.className = 'font-bold text-lg text-white border-b-2 border-brand-green pb-1';
     tabLogin.className = 'font-medium text-lg text-brand-muted hover:text-white pb-1';
   } else {
     usernameField.classList.add('hidden');
+    usernameInput.required = false;
+    passwordInput.removeAttribute('minlength');
     submitBtn.textContent = 'Sign In';
     tabLogin.className = 'font-bold text-lg text-white border-b-2 border-brand-green pb-1';
     tabRegister.className = 'font-medium text-lg text-brand-muted hover:text-white pb-1';
   }
+}
+
+function saveSession(token, user) {
+  state.token = token;
+  state.user = user;
+  localStorage.setItem('filmlog_token', token);
+  localStorage.setItem('filmlog_user', JSON.stringify(user));
+}
+
+function clearSession() {
+  state.token = null;
+  state.user = null;
+  state.watchlist = [];
+  state.watchedList = [];
+  localStorage.removeItem('filmlog_token');
+  localStorage.removeItem('filmlog_user');
+  updateWatchlistBadge();
+  renderWatchlistGrid();
+  renderWatchedList();
+  renderAuthUI();
+  if (state.filteredMovies.length) renderMovieGrid();
 }
 
 async function handleAuthSubmit(event) {
@@ -882,59 +1010,48 @@ async function handleAuthSubmit(event) {
   const username = document.getElementById('auth-username').value.trim();
   const errorEl = document.getElementById('auth-error-msg');
   const submitBtn = document.getElementById('auth-submit-btn');
+  const isRegister = state.authMode === 'register';
 
   errorEl.classList.add('hidden');
   submitBtn.disabled = true;
   submitBtn.textContent = 'Processing...';
 
   try {
-    const endpoint = state.authMode === 'register' ? '/auth/register' : '/auth/login';
-    const payload = state.authMode === 'register' 
-      ? { email, password, username: username || email.split('@')[0] } 
-      : { email, password };
-
-    const data = await apiFetch(endpoint, {
+    // Register: { username, email, password } -> 201 { token, user }
+    // Login:    { email, password }            -> 200 { token, user }
+    const data = await apiFetch(isRegister ? '/auth/register' : '/auth/login', {
       method: 'POST',
-      body: JSON.stringify(payload)
+      body: JSON.stringify(isRegister ? { username, email, password } : { email, password })
     });
 
-    // Handle token format: could be { token: "..." } or { data: { token: "...", user: {...} } }
-    const token = data.token || (data.data && data.data.token) || (data.user && data.user.token);
-    const user = data.user || (data.data && data.data.user) || { email, username: username || email };
+    if (!data.token) throw new ApiError('Respons backend tidak berisi token.', 500);
 
-    if (token) {
-      state.token = token;
-      state.user = user;
-      localStorage.setItem('filmlog_token', token);
-      localStorage.setItem('filmlog_user', JSON.stringify(user));
-      showToast(`Berhasil masuk sebagai ${user.username || user.email}! 👋`, 'success');
-      closeAuthModal();
-      renderAuthUI();
-      loadWatchlist();
-      loadWatchedList();
-      applyMovieFilters();
-    } else {
-      showToast('Registrasi berhasil! Silakan login.', 'success');
-      setAuthMode('login');
-    }
+    saveSession(data.token, data.user || { email, username });
+    showToast(`Berhasil masuk sebagai ${state.user.username || state.user.email}! 👋`, 'success');
+    document.getElementById('auth-form').reset();
+    closeAuthModal();
+    renderAuthUI();
+    loadWatchlist();
+    loadWatchedList();
   } catch (err) {
-    errorEl.textContent = err.message;
+    errorEl.textContent = err.message; // pesan validasi Laravel dipisah per baris
     errorEl.classList.remove('hidden');
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = state.authMode === 'register' ? 'Create Account' : 'Sign In';
+    submitBtn.textContent = isRegister ? 'Create Account' : 'Sign In';
   }
 }
 
+function handleSessionExpired() {
+  if (!state.token) return; // sudah dibersihkan oleh request lain
+  clearSession();
+  if (state.currentTab === 'watchlist' || state.currentTab === 'watched') switchTab('discover');
+  showToast('Sesi berakhir, silakan login lagi.', 'warning');
+  openAuthModal('login');
+}
+
 function logout() {
-  state.token = null;
-  state.user = null;
-  state.watchlist = [];
-  state.watchedList = [];
-  localStorage.removeItem('filmlog_token');
-  localStorage.removeItem('filmlog_user');
-  renderAuthUI();
-  applyMovieFilters();
+  clearSession();
   switchTab('discover');
   showToast('Anda telah keluar (Logged out)', 'info');
 }
@@ -969,6 +1086,12 @@ function saveApiBaseUrl() {
   updateApiUrlDisplay();
   closeApiConfigModal();
   showToast(`API URL diubah ke: ${val}`, 'success');
+
+  // Reset filter & katalog karena backend berganti.
+  state.catalog = [];
+  state.selectedGenre = 'ALL';
+  state.searchQuery = '';
+  document.getElementById('movie-search').value = '';
   loadDiscoverMovies();
   if (state.token) {
     loadWatchlist();
@@ -985,12 +1108,7 @@ function showToast(message, type = 'info') {
   const icon = document.getElementById('toast-icon');
   const msg = document.getElementById('toast-message');
 
-  const icons = {
-    success: '🟢',
-    error: '🔴',
-    warning: '🟡',
-    info: '🔵'
-  };
+  const icons = { success: '🟢', error: '🔴', warning: '🟡', info: '🔵' };
 
   icon.textContent = icons[type] || '🔵';
   msg.textContent = message;

@@ -141,7 +141,7 @@
           </button>
           <div class="relative">
             <i data-lucide="search" class="w-4 h-4 text-brand-muted absolute left-3 top-1/2 -translate-y-1/2"></i>
-            <input type="text" id="movie-search" placeholder="Filter title or director..." oninput="handleMovieFilter()" class="bg-brand-dark border border-brand-border rounded-xl pl-9 pr-4 py-2 text-sm text-white placeholder-brand-muted focus:outline-none focus:border-brand-green w-48 sm:w-64 transition" />
+            <input type="text" id="movie-search" placeholder="Cari judul atau sutradara..." oninput="handleMovieFilter()" class="bg-brand-dark border border-brand-border rounded-xl pl-9 pr-4 py-2 text-sm text-white placeholder-brand-muted focus:outline-none focus:border-brand-green w-48 sm:w-64 transition" />
           </div>
         </div>
       </div>
@@ -231,7 +231,7 @@
       <div class="bg-brand-surface p-6 rounded-2xl border border-brand-border shadow-xl space-y-4">
         <label for="ai-prompt-input" class="block text-xs font-semibold text-brand-muted uppercase tracking-wider">Your Movie Mood / Description</label>
         <div class="relative">
-          <textarea id="ai-prompt-input" rows="3" placeholder="Contoh: 'Saya ingin film sci-fi misteri dengan twist akhir tak terduga yang bikin mikir keras seperti Inception atau Shutter Island'..." class="w-full bg-brand-dark border border-brand-border rounded-xl p-4 text-sm text-white placeholder-brand-muted/70 focus:outline-none focus:border-brand-green transition resize-none"></textarea>
+          <textarea id="ai-prompt-input" rows="3" maxlength="1000" placeholder="Contoh: 'Saya ingin film sci-fi misteri dengan twist akhir tak terduga yang bikin mikir keras seperti Inception atau Shutter Island'..." class="w-full bg-brand-dark border border-brand-border rounded-xl p-4 text-sm text-white placeholder-brand-muted/70 focus:outline-none focus:border-brand-green transition resize-none"></textarea>
         </div>
 
         <!-- Quick Idea Chips -->
@@ -298,20 +298,20 @@
       <form id="auth-form" onsubmit="handleAuthSubmit(event)" class="space-y-4">
         <div id="field-username-container" class="space-y-1.5 hidden">
           <label class="text-xs font-semibold text-brand-muted uppercase">Username</label>
-          <input type="text" id="auth-username" placeholder="johndoe" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
+          <input type="text" id="auth-username" placeholder="username" minlength="3" maxlength="50" pattern="[A-Za-z0-9_\-]+" title="3-50 karakter: huruf, angka, underscore (_), atau strip (-)" autocomplete="username" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
         </div>
 
         <div class="space-y-1.5">
           <label class="text-xs font-semibold text-brand-muted uppercase">Email Address</label>
-          <input type="email" id="auth-email" required placeholder="user@example.com" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
+          <input type="email" id="auth-email" required autocomplete="email" placeholder="user@example.com" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
         </div>
 
         <div class="space-y-1.5">
           <label class="text-xs font-semibold text-brand-muted uppercase">Password</label>
-          <input type="password" id="auth-password" required placeholder="••••••••" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
+          <input type="password" id="auth-password" required autocomplete="current-password" placeholder="••••••••" class="w-full bg-brand-dark border border-brand-border rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-brand-green" />
         </div>
 
-        <div id="auth-error-msg" class="text-xs text-rose-400 bg-rose-950/40 border border-rose-900/50 p-2.5 rounded-lg hidden"></div>
+        <div id="auth-error-msg" class="text-xs text-rose-400 bg-rose-950/40 border border-rose-900/50 p-2.5 rounded-lg whitespace-pre-line hidden"></div>
 
         <button type="submit" id="auth-submit-btn" class="w-full py-2.5 bg-brand-green text-black font-bold text-sm rounded-xl hover:brightness-110 transition mt-2">
           Sign In
