@@ -3,6 +3,10 @@
 use App\Models\User;
 
 return [
+    'api' => [
+        'driver' => 'jwt',
+        'provider' => 'users',
+    ],
 
     /*
     |--------------------------------------------------------------------------
@@ -40,6 +44,10 @@ return [
     'guards' => [
         'web' => [
             'driver' => 'session',
+            'provider' => 'users',
+        ],
+        'api' => [
+            'driver' => 'jwt',
             'provider' => 'users',
         ],
     ],
