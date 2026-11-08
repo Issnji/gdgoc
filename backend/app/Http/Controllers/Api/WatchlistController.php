@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Movie;
 use App\Models\Watchlist;
+use App\Http\Requests\StoreWatchlistRequest;
 use Illuminate\Http\Request;
 use Illuminate\Database\QueryException;
 
@@ -19,22 +20,29 @@ class WatchlistController extends Controller
         return response()->json($items->pluck('movie'));
     }
 
-    public function store(Request $request)
+    public function store(StoreWatchlistRequest $request)
     {
-        $data = $request->validate(['movieId' => ['required', 'integer', 'exists:movies,id']]);
-        $userId = $request->user()->id;
+        $userId = auth('api')->id();
 
-        if (Watchlist::where('user_id', $userId)->where('movie_id', $data['movieId'])->exists()) {
-            return response()->json(['message' => 'Film sudah ada di watchlist.'], 409);
+        $exists = Watchlist::where('user_id', $userId)
+            ->where('movie_id', $request->movieId)
+            ->exists();
+
+        if ($exists) {
+            return response()->json([
+                'message' => 'Film sudah ada di watchlist.',
+            ], 409);
         }
 
-        $item = Watchlist::create([
+        $watchlist = Watchlist::create([
             'user_id' => $userId,
-            'movie_id' => $data['movieId'],
-            'created_at' => now(),
+            'movie_id' => $request->movieId,
         ]);
 
-        return response()->json(['message' => 'Film ditambahkan ke watchlist.', 'data' => $item->load('movie')], 201);
+        return response()->json([
+            'message' => 'Film berhasil ditambahkan.',
+            'data' => $watchlist,
+        ], 201);
     }
 
     public function destroy(Request $request, int $movieId)
