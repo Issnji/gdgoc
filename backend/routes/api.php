@@ -20,3 +20,8 @@ Route::middleware('auth:api')->group(function () {
     Route::post('/watchlist', [WatchlistController::class, 'store']);
     Route::delete('/watchlist/{movieId}', [WatchlistController::class, 'destroy']);
 });
+
+Route::middleware('auth:api')->group(function () {
+    Route::get('/watched', [WatchedController::class, 'index']);
+    Route::post('/watched', [WatchedController::class, 'store']);
+});
