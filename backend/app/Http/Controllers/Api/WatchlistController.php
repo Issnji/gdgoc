@@ -3,49 +3,83 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Movie;
 use App\Models\Watchlist;
 use Illuminate\Http\Request;
-use Illuminate\Database\QueryException;
 
 class WatchlistController extends Controller
 {
-    public function index(Request $request)
+    // Menampilkan watchlist milik user yang login
+    public function index()
     {
-        $items = Watchlist::with('movie')
-            ->where('user_id', $request->user()->id)
-            ->orderByDesc('created_at')->get();
+        $userId = auth('api')->id();
 
-        return response()->json($items->pluck('movie'));
+        $watchlist = Watchlist::with('movie')
+            ->where('user_id', $userId)
+            ->get();
+
+        return response()->json([
+            'message' => 'Watchlist berhasil diambil.',
+            'data' => $watchlist
+        ], 200);
     }
 
+    // Menambahkan film ke watchlist
     public function store(Request $request)
     {
-        $data = $request->validate(['movieId' => ['required', 'integer', 'exists:movies,id']]);
-        $userId = $request->user()->id;
-
-        if (Watchlist::where('user_id', $userId)->where('movie_id', $data['movieId'])->exists()) {
-            return response()->json(['message' => 'Film sudah ada di watchlist.'], 409);
-        }
-
-        $item = Watchlist::create([
-            'user_id' => $userId,
-            'movie_id' => $data['movieId'],
-            'created_at' => now(),
+        $validated = $request->validate([
+            'movieId' => 'required|integer|exists:movies,id',
         ]);
 
-        return response()->json(['message' => 'Film ditambahkan ke watchlist.', 'data' => $item->load('movie')], 201);
-    }
+        $userId = auth('api')->id();
 
-    public function destroy(Request $request, int $movieId)
-    {
-        $deleted = Watchlist::where('user_id', $request->user()->id)
-            ->where('movie_id', $movieId)->delete();
+        // Periksa apakah film sudah ada di watchlist user
+        $exists = Watchlist::where('user_id', $userId)
+            ->where('movie_id', $validated['movieId'])
+            ->exists();
 
-        if (!$deleted) {
-            return response()->json(['message' => 'Film tidak ditemukan di watchlist.'], 404);
+        if ($exists) {
+            return response()->json([
+                'message' => 'Film sudah ada di watchlist.'
+            ], 409);
         }
 
-        return response()->json(['message' => 'Film dihapus dari watchlist.']);
+        $watchlist = Watchlist::create([
+            'user_id' => $userId,
+            'movie_id' => $validated['movieId'],
+        ]);
+
+        return response()->json([
+            'message' => 'Film berhasil ditambahkan ke watchlist.',
+            'data' => $watchlist
+        ], 201);
+    }
+
+    // Menghapus film dari watchlist
+    public function destroy($movie)
+    {
+        $userId = auth('api')->id();
+
+        // Cari berdasarkan film terlebih dahulu
+        $watchlist = Watchlist::where('movie_id', $movie)
+            ->first();
+
+        if (!$watchlist) {
+            return response()->json([
+                'message' => 'Data watchlist tidak ditemukan.'
+            ], 404);
+        }
+
+        // Periksa kepemilikan data
+        if ($watchlist->user_id != $userId) {
+            return response()->json([
+                'message' => 'Kamu tidak memiliki akses ke watchlist ini.'
+            ], 403);
+        }
+
+        $watchlist->delete();
+
+        return response()->json([
+            'message' => 'Film berhasil dihapus dari watchlist.'
+        ], 200);
     }
 }
