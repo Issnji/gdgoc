@@ -25,3 +25,5 @@ Route::middleware('auth:api')->group(function () {
     Route::get('/watched', [WatchedController::class, 'index']);
     Route::post('/watched', [WatchedController::class, 'store']);
 });
+
+Route::post('/movies/recommend', [MovieController::class, 'recommend']);
