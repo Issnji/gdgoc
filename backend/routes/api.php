@@ -16,14 +16,16 @@ Route::get('/movies/{movie}', [MovieController::class, 'show'])
     ->whereNumber('movie');
 
 Route::middleware('auth:api')->group(function () {
+
     Route::get('/watchlist', [WatchlistController::class, 'index']);
     Route::post('/watchlist', [WatchlistController::class, 'store']);
-    Route::delete('/watchlist/{movieId}', [WatchlistController::class, 'destroy']);
-});
+    Route::delete('/watchlist/{movie}', [WatchlistController::class, 'destroy'])
+        ->whereNumber('movie');
 
-Route::middleware('auth:api')->group(function () {
     Route::get('/watched', [WatchedController::class, 'index']);
     Route::post('/watched', [WatchedController::class, 'store']);
+    Route::delete('/watched/{movie}', [WatchedController::class, 'destroy'])
+        ->whereNumber('movie');
 });
 
 Route::post('/movies/recommend', [MovieController::class, 'recommend']);
