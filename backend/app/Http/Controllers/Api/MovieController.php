@@ -34,9 +34,19 @@ class MovieController extends Controller
         return response()->json($query->get());
     }
 
-    public function show(int $movie)
+    public function show($id)
     {
-        return response()->json(Movie::findOrFail($movie));
+        $movie = Movie::find($id);
+
+        if (!$movie) {
+            return response()->json([
+                'message' => 'Film tidak ditemukan.',
+            ], 404);
+        }
+
+        return response()->json([
+            'data' => $movie,
+        ], 200);
     }
 
     public function recommend(Request $request, GeminiRecommendationService $service)
