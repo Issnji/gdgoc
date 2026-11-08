@@ -14,3 +14,9 @@ Route::prefix('auth')->group(function () {
 Route::get('/movies', [MovieController::class, 'index']);
 Route::get('/movies/{movie}', [MovieController::class, 'show'])
     ->whereNumber('movie');
+
+Route::middleware('auth:api')->group(function () {
+    Route::get('/watchlist', [WatchlistController::class, 'index']);
+    Route::post('/watchlist', [WatchlistController::class, 'store']);
+    Route::delete('/watchlist/{movieId}', [WatchlistController::class, 'destroy']);
+});
